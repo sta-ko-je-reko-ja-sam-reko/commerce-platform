@@ -1,0 +1,573 @@
+openapi: 3.1.0
+info:
+  title: ERP Commerce Contract
+  version: 1.0.0
+  summary: The surface Business Central exposes to the commerce platform.
+  description: |
+    Consumed by the commerce platform through the integration layer, implemented by the
+    Business Central connector. This document is the single source of truth for both sides;
+    each pins a released version and validates against it in its own pipeline.
+
+    Two classes of operation, per ADR 0002:
+
+    - Projected — bulk, cursor-paged delta feeds that populate the platform's own read
+      model. Never called on a customer request path.
+    - Read-through — bulk, low-latency lookups called at cart and checkout, where
+      correctness outranks latency.
+
+    Every read-through response is wrapped in an envelope carrying source, asOf and
+    degraded, so a caller cannot consume a stale or fallback value without knowing it
+    (ADR 0004).
+
+servers:
+  - url: https://{gateway}/erp/v1
+    variables:
+      gateway:
+        default: api.example.invalid
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: catalogue
+    description: Projected delta feeds. Cursor-paged, never offset-paged.
+  - name: pricing
+    description: Read-through customer price resolution. Bulk only.
+  - name: availability
+    description: Read-through available-to-promise. Bulk only.
+  - name: credit
+    description: Read-through credit gate.
+  - name: orders
+    description: Asynchronous, idempotent write path.
+
+paths:
+  /catalogue/items:
+    get:
+      tags: [catalogue]
+      operationId: getCatalogueItemsDelta
+      summary: Cursor-paged item delta feed
+      description: |
+        Returns items changed at or after changedAfter, ordered by (changedAt, id).
+        Continue by passing back the nextCursor from the previous page. There is no
+        offset parameter by design: offset paging degrades quadratically over a catalogue
+        of this size (ADR 0003).
+
+        An empty changedAfter performs a full initial load over the same cursor
+        mechanism, so the bootstrap path and the steady-state path are the same code.
+      parameters:
+        - name: changedAfter
+          in: query
+          description: Watermark. Omit for a full initial load.
+          schema: { type: string, format: date-time }
+        - name: cursor
+          in: query
+          description: Opaque continuation token from the previous page's nextCursor.
+          schema: { type: string }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+        - name: includeDeleted
+          in: query
+          description: Include tombstones for items removed or blocked since the watermark.
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: A page of changed items.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ItemPage' }
+        '429': { $ref: '#/components/responses/Throttled' }
+
+  /catalogue/categories:
+    get:
+      tags: [catalogue]
+      operationId: getCategoryTree
+      summary: The whole category tree
+      description: |
+        The tree is small — dozens of nodes — so it is returned whole rather than paged.
+        Each node carries its materialized path, which the platform stores denormalized on
+        every product document to make facet filtering a single term query.
+      responses:
+        '200':
+          description: The complete tree.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [categories, asOf]
+                properties:
+                  asOf: { type: string, format: date-time }
+                  categories:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+
+  /catalogue/prices:
+    get:
+      tags: [catalogue]
+      operationId: getListPricesDelta
+      summary: Cursor-paged list-price delta feed
+      description: |
+        List and campaign prices for display only. The price a customer actually pays is
+        never taken from this feed — see /pricing/resolve.
+      parameters:
+        - name: changedAfter
+          in: query
+          schema: { type: string, format: date-time }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        '200':
+          description: A page of changed prices.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPricePage' }
+        '429': { $ref: '#/components/responses/Throttled' }
+
+  /catalogue/reconciliation:
+    get:
+      tags: [catalogue]
+      operationId: getCatalogueHashes
+      summary: Content hashes for full reconciliation
+      description: |
+        Returns a content hash per item over the full catalogue, cursor-paged. The nightly
+        reconcile compares these against the projection and repairs differences, which is
+        what makes the projection trustworthy in the presence of lost events (ADR 0003).
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 1000 }
+      responses:
+        '200':
+          description: A page of item hashes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hashes]
+                properties:
+                  hashes:
+                    type: array
+                    items:
+                      type: object
+                      required: [itemId, contentHash]
+                      properties:
+                        itemId: { type: string }
+                        contentHash: { type: string }
+                  nextCursor: { type: string, nullable: true }
+
+  /pricing/resolve:
+    post:
+      tags: [pricing]
+      operationId: resolvePrices
+      summary: Resolve customer-specific prices for a set of lines
+      description: |
+        Bulk only, capped at 100 lines. There is deliberately no single-line variant:
+        offering one guarantees a caller loops over it and turns a basket into N round
+        trips (ADR 0003).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PriceRequest' }
+      responses:
+        '200':
+          description: Resolved prices, in the order the lines were supplied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PriceResponse' }
+        '422': { $ref: '#/components/responses/UnprocessableBatch' }
+        '429': { $ref: '#/components/responses/Throttled' }
+
+  /availability/check:
+    post:
+      tags: [availability]
+      operationId: checkAvailability
+      summary: Available-to-promise for a set of lines
+      description: |
+        Bulk only, capped at 100 lines. requestedDate and locationId are per line,
+        because a basket routinely spans locations and delivery dates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AvailabilityRequest' }
+      responses:
+        '200':
+          description: Availability per line, in the order supplied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AvailabilityResponse' }
+        '422': { $ref: '#/components/responses/UnprocessableBatch' }
+        '429': { $ref: '#/components/responses/Throttled' }
+
+  /customers/{customerId}/credit:
+    get:
+      tags: [credit]
+      operationId: getCreditStanding
+      summary: Credit standing and blocked status
+      description: |
+        A hard gate at checkout. When this call cannot be completed, checkout blocks —
+        credit is never assumed (ADR 0004).
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Credit standing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreditStandingEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /orders:
+    post:
+      tags: [orders]
+      operationId: submitOrder
+      summary: Submit an order or quote for creation
+      description: |
+        Asynchronous and idempotent. Returns 202 with a platform-side identifier; the ERP
+        document number arrives later on the order-status projection.
+
+        Idempotency-Key is generated by the originating business action and is stable
+        across every retry of that action. A repeated key returns the original result and
+        creates nothing (ADR 0005).
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 16, maxLength: 64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderSubmission' }
+      responses:
+        '202':
+          description: Accepted for processing. Not a confirmation that the order exists in the ERP.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderAccepted' }
+        '200':
+          description: This idempotency key was already processed. The original result is returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderAccepted' }
+        '409':
+          description: The key was seen with a different payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Client-credentials token, one registration per consumer.
+
+  responses:
+    Throttled:
+      description: Rate limited. Honour Retry-After rather than retrying immediately.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnprocessableBatch:
+      description: The batch exceeded the line cap or was structurally invalid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        correlationId: { type: string }
+
+    Envelope:
+      type: object
+      description: |
+        Provenance wrapper on every read-through response. A consumer that ignores these
+        fields cannot tell a live value from a fallback, so they are part of the contract
+        rather than a header.
+      required: [source, asOf, degraded]
+      properties:
+        source:
+          type: string
+          enum: [live, cached]
+        asOf: { type: string, format: date-time }
+        degraded:
+          type: boolean
+          description: True when the value is a documented fallback rather than a resolved result.
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount: { type: number }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+
+    StockBand:
+      type: string
+      description: Never an exact quantity on a projected surface (ADR 0002).
+      enum: [in_stock, low, out_of_stock, unknown]
+
+    Category:
+      type: object
+      required: [id, name, path]
+      properties:
+        id: { type: string }
+        parentId: { type: string, nullable: true }
+        name: { type: string }
+        path:
+          type: string
+          description: Materialized path, for example /insulation/mineral-wool/rolls.
+        sortOrder: { type: integer }
+        active: { type: boolean }
+
+    Item:
+      type: object
+      required: [id, number, name, categoryPath, unitOfMeasure, status]
+      properties:
+        id: { type: string, description: Stable surrogate identifier. }
+        number: { type: string, description: Business-facing item number. }
+        name: { type: string }
+        description: { type: string }
+        categoryPath: { type: string }
+        unitOfMeasure: { type: string }
+        salesUnitOfMeasure: { type: string }
+        status:
+          type: string
+          enum: [active, blocked, discontinued, deleted]
+        attributes:
+          type: object
+          additionalProperties: { type: string }
+        mediaRefs:
+          type: array
+          description: References only. Image bytes never pass through the ERP (ADR 0003).
+          items: { type: string }
+        variantOf: { type: string, nullable: true }
+        stockBand: { $ref: '#/components/schemas/StockBand' }
+        changedAt: { type: string, format: date-time }
+        contentHash: { type: string }
+
+    ItemPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Item' }
+        nextCursor:
+          type: string
+          nullable: true
+          description: Absent or null when the feed is caught up.
+        watermark:
+          type: string
+          format: date-time
+          description: Safe watermark to resume from once this page is durably applied.
+
+    ListPrice:
+      type: object
+      required: [itemId, priceGroup, unitPrice, validFrom]
+      properties:
+        itemId: { type: string }
+        priceGroup: { type: string }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+        minimumQuantity: { type: number }
+        validFrom: { type: string, format: date-time }
+        validTo: { type: string, format: date-time, nullable: true }
+        campaign: { type: string, nullable: true }
+        changedAt: { type: string, format: date-time }
+
+    ListPricePage:
+      type: object
+      required: [prices]
+      properties:
+        prices:
+          type: array
+          items: { $ref: '#/components/schemas/ListPrice' }
+        nextCursor: { type: string, nullable: true }
+        watermark: { type: string, format: date-time }
+
+    PriceRequestLine:
+      type: object
+      required: [lineRef, itemId, quantity]
+      properties:
+        lineRef: { type: string, description: Caller-owned. Echoed back for correlation. }
+        itemId: { type: string }
+        variantId: { type: string, nullable: true }
+        quantity: { type: number, minimum: 0 }
+        unitOfMeasure: { type: string }
+        requestedDate: { type: string, format: date }
+
+    PriceRequest:
+      type: object
+      required: [customerId, lines]
+      properties:
+        customerId: { type: string }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/PriceRequestLine' }
+
+    ResolvedPrice:
+      type: object
+      required: [lineRef, unitPrice, source]
+      properties:
+        lineRef: { type: string }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+        listPrice: { $ref: '#/components/schemas/Money' }
+        discountPercent: { type: number }
+        source:
+          type: string
+          description: Which commercial rule produced the price. Shown to sales, not to the customer.
+          enum: [contract, customer_group, campaign, volume_break, list]
+        unavailable:
+          type: boolean
+          description: True when no price could be resolved. The line is not sellable online.
+
+    PriceResponse:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [lines]
+          properties:
+            lines:
+              type: array
+              items: { $ref: '#/components/schemas/ResolvedPrice' }
+
+    AvailabilityRequestLine:
+      type: object
+      required: [lineRef, itemId, quantity]
+      properties:
+        lineRef: { type: string }
+        itemId: { type: string }
+        variantId: { type: string, nullable: true }
+        quantity: { type: number, minimum: 0 }
+        locationId: { type: string }
+        requestedDate: { type: string, format: date }
+
+    AvailabilityRequest:
+      type: object
+      required: [lines]
+      properties:
+        customerId: { type: string }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/AvailabilityRequestLine' }
+
+    LineAvailability:
+      type: object
+      required: [lineRef, availableQuantity, band]
+      properties:
+        lineRef: { type: string }
+        availableQuantity: { type: number }
+        band: { $ref: '#/components/schemas/StockBand' }
+        earliestDate: { type: string, format: date, nullable: true }
+        locationId: { type: string }
+
+    AvailabilityResponse:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [lines]
+          properties:
+            lines:
+              type: array
+              items: { $ref: '#/components/schemas/LineAvailability' }
+
+    CreditStanding:
+      type: object
+      required: [blocked, currency]
+      properties:
+        blocked: { type: boolean }
+        blockedReason: { type: string, nullable: true }
+        creditLimit: { $ref: '#/components/schemas/Money' }
+        balance: { $ref: '#/components/schemas/Money' }
+        available: { $ref: '#/components/schemas/Money' }
+        overdueBalance: { $ref: '#/components/schemas/Money' }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        paymentTermsCode: { type: string }
+
+    CreditStandingEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - $ref: '#/components/schemas/CreditStanding'
+
+    OrderSubmissionLine:
+      type: object
+      required: [lineRef, itemId, quantity]
+      properties:
+        lineRef: { type: string }
+        itemId: { type: string }
+        variantId: { type: string, nullable: true }
+        quantity: { type: number, exclusiveMinimum: 0 }
+        unitOfMeasure: { type: string }
+        agreedUnitPrice: { $ref: '#/components/schemas/Money' }
+        locationId: { type: string }
+        requestedDeliveryDate: { type: string, format: date }
+
+    OrderSubmission:
+      type: object
+      required: [platformOrderId, customerId, documentType, lines]
+      properties:
+        platformOrderId:
+          type: string
+          description: The platform's own identifier. Survives every retry of this submission.
+        customerId: { type: string }
+        shipToId: { type: string, nullable: true }
+        documentType:
+          type: string
+          enum: [order, quote]
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        externalReference:
+          type: string
+          description: Customer purchase-order reference.
+        requestedDeliveryDate: { type: string, format: date }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: { $ref: '#/components/schemas/OrderSubmissionLine' }
+
+    OrderAccepted:
+      type: object
+      required: [platformOrderId, status]
+      properties:
+        platformOrderId: { type: string }
+        status:
+          type: string
+          description: |
+            received means staged for creation, not created. The ERP document number
+            arrives on the order-status projection (ADR 0005).
+          enum: [received, created, rejected]
+        erpDocumentNumber: { type: string, nullable: true }
+        correlationId: { type: string }

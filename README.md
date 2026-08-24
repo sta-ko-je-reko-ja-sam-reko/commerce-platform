@@ -41,9 +41,15 @@ docs/       architecture decision records, integration contracts, staleness budg
 
 Monorepo on pnpm workspaces with path-filtered CI, because the highest-frequency change is a contract change that touches several services at once.
 
+## Design decisions
+
+The reasoning behind the rules above is recorded in [`docs/adr/`](docs/adr/) — the read-through versus projection split, catalogue scale, degradation modes, and the single-writer idempotency guarantee. Each record states what was rejected and why.
+
+The interface between the three repositories lives in [`packages/contracts`](packages/contracts/), published as a versioned artefact and enforced by a validation gate that rejects changes reversing those decisions.
+
 ## Status
 
-Early design. No runtime code yet — architecture decisions and interface contracts land first.
+Foundations. Architecture decisions and the ERP contract are in place; service implementations follow.
 
 ## Licence
 

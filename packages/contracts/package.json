@@ -1,0 +1,24 @@
+{
+  "name": "@commerce/contracts",
+  "version": "1.0.0",
+  "description": "Versioned interface contracts between the commerce platform, the integration layer and Business Central.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./openapi": "./openapi/erp-commerce-v1.yaml",
+    "./asyncapi": "./asyncapi/erp-events-v1.yaml"
+  },
+  "files": ["src", "openapi", "asyncapi"],
+  "scripts": {
+    "validate": "node scripts/validate.mjs",
+    "generate": "openapi-typescript openapi/erp-commerce-v1.yaml -o src/generated/erp-commerce.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.4.0",
+    "typescript": "^5.6.0",
+    "yaml": "^2.5.0"
+  }
+}
