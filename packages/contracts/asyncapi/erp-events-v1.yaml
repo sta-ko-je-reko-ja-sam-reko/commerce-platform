@@ -1,0 +1,146 @@
+asyncapi: 3.0.0
+info:
+  title: ERP Commerce Events
+  version: 1.0.0
+  description: |
+    Events published by Business Central and distributed by the integration layer over
+    Service Bus topics. Events keep the projection warm between reconciliation passes;
+    they are not the guarantee of correctness. The nightly hash reconcile is (ADR 0003).
+
+    Consequences of that stance, which every consumer must implement:
+
+    - Handlers are idempotent. Redelivery is normal, not exceptional.
+    - Handlers tolerate gaps. A missing event is repaired by reconciliation, never by
+      blocking the stream.
+    - Events carry identity and a change marker, not full payloads for large entities.
+      A consumer fetches the current state from the delta feed rather than trusting a
+      possibly out-of-order body.
+
+defaultContentType: application/json
+
+channels:
+  catalogue.item.changed:
+    address: catalogue.item.changed
+    messages:
+      itemChanged:
+        $ref: '#/components/messages/ItemChanged'
+  catalogue.price.changed:
+    address: catalogue.price.changed
+    messages:
+      priceChanged:
+        $ref: '#/components/messages/PriceChanged'
+  inventory.stock.changed:
+    address: inventory.stock.changed
+    messages:
+      stockChanged:
+        $ref: '#/components/messages/StockChanged'
+  sales.order.statusChanged:
+    address: sales.order.statusChanged
+    messages:
+      orderStatusChanged:
+        $ref: '#/components/messages/OrderStatusChanged'
+
+operations:
+  receiveItemChanged:
+    action: receive
+    channel:
+      $ref: '#/channels/catalogue.item.changed'
+  receivePriceChanged:
+    action: receive
+    channel:
+      $ref: '#/channels/catalogue.price.changed'
+  receiveStockChanged:
+    action: receive
+    channel:
+      $ref: '#/channels/inventory.stock.changed'
+  receiveOrderStatusChanged:
+    action: receive
+    channel:
+      $ref: '#/channels/sales.order.statusChanged'
+
+components:
+  schemas:
+    EventEnvelope:
+      type: object
+      required: [eventId, occurredAt, correlationId, source]
+      properties:
+        eventId:
+          type: string
+          description: Unique per publication. The consumer's idempotency key.
+        occurredAt: { type: string, format: date-time }
+        correlationId:
+          type: string
+          description: Flows from the originating request through to ERP telemetry.
+        source:
+          type: string
+          description: Publishing system identifier.
+
+  messages:
+    ItemChanged:
+      name: ItemChanged
+      title: Item changed
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [itemId, changedAt]
+            properties:
+              itemId: { type: string }
+              changedAt: { type: string, format: date-time }
+              changeType:
+                type: string
+                enum: [created, updated, blocked, deleted]
+
+    PriceChanged:
+      name: PriceChanged
+      title: List or campaign price changed
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [changedAt]
+            properties:
+              itemId: { type: string, nullable: true }
+              priceGroup:
+                type: string
+                nullable: true
+                description: |
+                  A group-wide change omits itemId. The consumer must not attempt to
+                  enumerate affected items from the event; it re-pulls the price delta
+                  from the watermark instead.
+              changedAt: { type: string, format: date-time }
+
+    StockChanged:
+      name: StockChanged
+      title: Stock band changed
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [itemId, band]
+            properties:
+              itemId: { type: string }
+              locationId: { type: string }
+              band:
+                type: string
+                enum: [in_stock, low, out_of_stock, unknown]
+                description: |
+                  A band, never a quantity. Publishing exact quantities on a topic
+                  invites consumers to display them, which is the promise the projection
+                  cannot keep (ADR 0002).
+
+    OrderStatusChanged:
+      name: OrderStatusChanged
+      title: Order status changed
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            required: [platformOrderId, status]
+            properties:
+              platformOrderId: { type: string }
+              erpDocumentNumber: { type: string, nullable: true }
+              status:
+                type: string
+                enum: [created, confirmed, partially_shipped, shipped, invoiced, cancelled, rejected]
+              reason: { type: string, nullable: true }
