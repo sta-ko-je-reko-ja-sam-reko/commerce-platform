@@ -25,13 +25,20 @@ A category listing, a search, a facet count and a product detail page are all se
 
 ### Synchronisation is watermark-based, never offset-based
 
-Delta pulls order by a monotonic change marker and page forward on a **cursor**, never `$skip`:
+Delta pulls page forward on a **keyset cursor**, never `$skip`. The connector orders by `(changedAt, number)` and the caller resumes with the composite predicate:
 
 ```
-GET /catalogue/items?changedAfter=<watermark>&afterId=<lastSystemId>&pageSize=1000
+changedAt gt T or (changedAt eq T and number gt N)
 ```
 
-The connector orders by `(SystemModifiedAt, SystemId)` and the caller passes back the last pair it saw. Page cost stays constant regardless of catalogue size or how far through the sync it is. The composite cursor — timestamp *and* id — is what makes the page boundary safe when many rows share a timestamp, which is exactly what a bulk price update produces.
+where `(T, N)` is the last row applied. Page cost stays constant regardless of catalogue size or how far through the sync it is.
+
+The composite form is not a refinement — both simpler versions fail, and fail silently:
+
+- `changedAt gt T` **skips** every row that shares the boundary timestamp with the last row of the previous page. Nothing errors; those items simply keep their old price on the storefront.
+- `changedAt ge T` never skips, but **stalls permanently** once more rows share a timestamp than fit in one page: every request returns the same full page of valid data and the cursor never advances. A 1000-row page and a bulk update touching 1200 items is enough, and at this catalogue size that shape of update is routine.
+
+The tie-break column is the item number, not the system id. Keyset paging is correct only when the server's ordering and its `gt` comparison agree; that holds dependably for a string key and not for a GUID, whose `uniqueidentifier` sort order in SQL Server does not match the order its textual form suggests.
 
 Page size is capped at 1000 rows. Larger pages do not go faster; they raise the cost of a retry and increase the chance of hitting a request timeout.
 
